@@ -8,6 +8,16 @@
 - 最多 4 个影子并发, 名额满时跳过影子并注明原因, 主请求照常通过
 - 客户端断连同时终止两端; 影子通信实际退出后才归还名额
 - 不整份缓存/落盘响应, 每块读取后立即更新哈希并释放
+
+GET /quote 的 200 响应交付前正文校验 (防内容损坏却 HTTP 200 的坏报价):
+- 本地报价服务随 200 响应给出 X-Quote-SHA256 (交付字节的 SHA-256 摘要)
+- 网关先在内存中收齐主端正文 (上限 64KiB), 核对摘要后才向客户端交付原字节;
+  校验未通过前绝不向客户端发送任何报价字节
+- 摘要缺失 / 摘要不符 / 正文超过 64KiB / 正文未收完整 -> 统一 502 拒绝,
+  拒绝响应只含固定错误文案, 不泄漏任何报价字节或上游细节
+- 其他状态码 (非 200) 及 /quote-big 不做该校验, 仍按原规则逐块透传与比对
+- 拒绝即定性为终态 (primary_rejected): 终止对应影子调用, 通信实际退出后才
+  归还名额; 迟到的影子结果 (含超时/失败/比较结论) 一律不得改写拒绝结论
 """
 from __future__ import annotations
 
@@ -23,7 +33,7 @@ from typing import Optional
 
 import aiohttp
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 PRIMARY_URL = os.environ.get("PRIMARY_URL", "http://primary:8001")
@@ -31,7 +41,10 @@ SHADOW_URL = os.environ.get("SHADOW_URL", "http://shadow:8002")
 MAX_SHADOW_CALLS = int(os.environ.get("MAX_SHADOW_CALLS", "4"))
 SHADOW_TIMEOUT_S = float(os.environ.get("SHADOW_TIMEOUT_S", "2.0"))
 READ_CHUNK = 64 * 1024
+# GET /quote 200 正文校验: 最多只缓存/交付 64KiB, 超过即拒绝
+MAX_QUOTE_BODY = 64 * 1024
 MAX_RECORDS = int(os.environ.get("MAX_RECORDS", "100"))
+DIGEST_HEADER = "X-Quote-SHA256"
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -40,12 +53,14 @@ HOP_BY_HOP = {
     "content-length",
 }
 
-# 已定性的终态: finalize 不得覆盖
+# 已定性的终态: finalize / 迟到的影子结果均不得覆盖
 TERMINAL_RESULTS = {
     "match", "mismatch", "shadow_timeout", "shadow_error",
     "client_disconnected", "primary_error", "primary_incomplete",
-    "shadow_skipped_no_slot",
+    "primary_rejected", "shadow_skipped_no_slot",
 }
+
+log = logging.getLogger("gateway")
 
 
 @dataclass
@@ -119,6 +134,27 @@ def filtered_headers(resp: aiohttp.ClientResponse) -> dict[str, str]:
     return {k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP}
 
 
+def _set_result(rec: dict, result: str) -> bool:
+    """
+    写结果的统一入口: 已定性终态 (如 client_disconnected) 时, 迟到的影子
+    结果 (超时/失败/比较结论) 一律不得覆盖。
+    例外: 主端正文校验拒绝 (primary_rejected) 是面向客户端的最终结论,
+    即使此前因名额满跳过影子, 也以拒绝为准 (跳过事实保留在 shadow 字段)。
+    """
+    # 例外(优先于终态检查): 主端正文校验拒绝是面向客户端的最终结论,
+    # 即使此前因名额满跳过影子 (shadow_skipped_no_slot), 也以拒绝为准,
+    # 跳过事实仍保留在 rec["shadow"] 字段
+    if result == "primary_rejected" and rec["result"] == "shadow_skipped_no_slot":
+        rec["result"] = result
+        return True
+    if rec["result"] in TERMINAL_RESULTS:
+        log.warning("result %r ignored: record already terminal as %r",
+                    result, rec["result"])
+        return False
+    rec["result"] = result
+    return True
+
+
 async def run_shadow(ctx: CallContext) -> None:
     """
     执行一次影子调用 (从发起起整体 2s 硬超时)。
@@ -139,22 +175,22 @@ async def run_shadow(ctx: CallContext) -> None:
                     shadow_hash.update(chunk)  # 流式哈希, 不缓存整份响应
                 shadow_digest = shadow_hash.hexdigest()
         except asyncio.TimeoutError:
-            rec["result"] = "shadow_timeout"
             rec["shadow"] = f"timeout after {SHADOW_TIMEOUT_S:g}s"
+            _set_result(rec, "shadow_timeout")
             return
         except asyncio.CancelledError:
-            # 客户端断连或主端失败: 影子随主端一起终止
-            rec["result"] = "client_disconnected"
+            # 客户端断连或主端失败/拒绝: 影子随主端一起终止
             rec["shadow"] = "cancelled with primary"
+            _set_result(rec, "client_disconnected")
             raise
         except aiohttp.ClientError as exc:
-            rec["result"] = "shadow_error"
             rec["shadow"] = f"connection error: {type(exc).__name__}"
+            _set_result(rec, "shadow_error")
             return
         except Exception as exc:  # 防御: 影子侧任何意外都不能拖垮主流程
-            logging.getLogger("shadow").exception("shadow task failed: %r", exc)
-            rec["result"] = "shadow_error"
+            log.exception("shadow task failed: %r", exc)
             rec["shadow"] = f"unexpected error: {type(exc).__name__}: {exc}"
+            _set_result(rec, "shadow_error")
             return
 
         rec["shadow_status"] = shadow_status
@@ -164,10 +200,12 @@ async def run_shadow(ctx: CallContext) -> None:
 
         if not ctx.primary_done:
             # 主端尚未完整结束, 暂时不能比较; 最终结果由 finalize 补算
-            rec["result"] = "shadow_completed_primary_incomplete"
+            _set_result(rec, "shadow_completed_primary_incomplete")
             return
 
-        _compare(rec)
+        # 主端已定性终态 (如校验拒绝 primary_rejected) 时不得再比较、不得覆盖
+        if rec["result"] not in TERMINAL_RESULTS:
+            _compare(rec)
     finally:
         ctx.shadow_done = True
         if acquired:
@@ -226,7 +264,137 @@ async def save_record(ctx: CallContext) -> None:
     await append_record(ctx.record)
 
 
-async def proxy(request: Request, target: str) -> StreamingResponse:
+async def terminate_shadow(ctx: CallContext) -> None:
+    """
+    主端失败/拒绝/断连时终止对应影子调用, 并等待其通信实际退出
+    (名额由 run_shadow 的 finally 在退出时归还)。
+    """
+    task = ctx.shadow_task
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await asyncio.shield(task)
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def reject_response() -> JSONResponse:
+    """统一 502 拒绝: 固定文案, 不含任何上游报价字节或细节。"""
+    return JSONResponse(
+        status_code=502,
+        content={"detail": "quote rejected: integrity check failed"},
+    )
+
+
+class _BodyTooLarge(Exception):
+    def __init__(self, size: int):
+        super().__init__(size)
+        self.size = size
+
+
+async def validated_proxy(request: Request, ctx: CallContext, target: str,
+                          primary_resp: aiohttp.ClientResponse) -> Response:
+    """
+    GET /quote 且主端 200 的交付前正文校验路径:
+    先在内存中收齐正文 (硬上限 64KiB), 核对 X-Quote-SHA256 后才交付原字节;
+    任何异常都返回 502 且不向客户端泄漏报价字节。
+    """
+    rec = ctx.record
+    chunks: list[bytes] = []
+    primary_hash = hashlib.sha256()
+    total = 0
+    try:
+        async for chunk in primary_resp.content.iter_chunked(READ_CHUNK):
+            if await request.is_disconnected():
+                raise asyncio.CancelledError
+            total += len(chunk)
+            if total > MAX_QUOTE_BODY:
+                # 超限立即停止读取并拒绝: 不缓存也不转发剩余字节
+                raise _BodyTooLarge(total)
+            primary_hash.update(chunk)
+            chunks.append(chunk)
+    except asyncio.CancelledError:
+        rec["primary"] = "aborted before completion"
+        _set_result(rec, "client_disconnected")
+        primary_resp.release()
+        await terminate_shadow(ctx)
+        await save_record(ctx)
+        return reject_response()
+    except _BodyTooLarge as exc:
+        reason = "quote body too large"
+        detail = f"primary quote body exceeds {MAX_QUOTE_BODY} bytes (>= {exc.size})"
+        return await _reject_primary(ctx, rec, primary_resp, reason, detail)
+    except aiohttp.ClientError as exc:
+        reason = "quote body incomplete"
+        detail = f"primary stream ended before complete: {type(exc).__name__}"
+        return await _reject_primary(ctx, rec, primary_resp, reason, detail)
+    except Exception as exc:  # 防御: 读取阶段任何意外都按未收完整拒绝, 绝不交付半成品
+        log.exception("validated quote read failed: %r", exc)
+        return await _reject_primary(
+            ctx, rec, primary_resp, "quote body incomplete",
+            f"unexpected read error: {type(exc).__name__}")
+
+    # 主端正文已完整收齐
+    primary_resp.release()
+    ctx.primary_done = True
+    rec["primary_status"] = primary_resp.status
+    rec["primary_sha256"] = primary_hash.hexdigest()
+    rec["primary_ms"] = now_ms() - ctx.started_at
+
+    advertised = primary_resp.headers.get(DIGEST_HEADER)
+    if not advertised:
+        return await _reject_primary(
+            ctx, rec, primary_resp, "digest missing",
+            f"{DIGEST_HEADER} header absent on 200 response")
+    if advertised.strip().lower() != rec["primary_sha256"]:
+        return await _reject_primary(
+            ctx, rec, primary_resp, "digest mismatch",
+            f"{DIGEST_HEADER} does not match delivered bytes")
+
+    # 校验通过: 交付主端原始状态码与原始字节 (未参与哈希的响应头原样透传)
+    rec["primary"] = "completed"
+    log.info("quote digest verified, delivering %d bytes rid=%s", total, ctx.rid)
+    if ctx.shadow_task is None:
+        await save_record(ctx)
+        return Response(
+            content=b"".join(chunks),
+            status_code=primary_resp.status,
+            headers=filtered_headers(primary_resp),
+            media_type=primary_resp.headers.get("Content-Type"),
+        )
+    # 影子仍在跑时先落 shadow_pending, 其退出后原地更新; 不等待影子
+    finalize(rec, ctx)
+    await save_record(ctx)
+    return Response(
+        content=b"".join(chunks),
+        status_code=primary_resp.status,
+        headers=filtered_headers(primary_resp),
+        media_type=primary_resp.headers.get("Content-Type"),
+    )
+
+
+async def _reject_primary(ctx: CallContext, rec: dict,
+                          primary_resp: aiohttp.ClientResponse,
+                          reason: str, detail: str) -> JSONResponse:
+    """
+    定性为终态 primary_rejected: 记录原因、终止影子 (退出后才归还名额)、
+    落库, 返回不含任何报价字节的 502。迟到影子结果不得改写该结论。
+    """
+    rec["primary"] = f"rejected: {reason}"
+    rec["reject_reason"] = reason
+    rec["detail"] = detail
+    _set_result(rec, "primary_rejected")
+    log.warning("primary quote rejected rid=%s reason=%s detail=%s",
+                ctx.rid, reason, detail)
+    primary_resp.release()
+    await terminate_shadow(ctx)
+    await save_record(ctx)
+    return reject_response()
+
+
+async def proxy(request: Request, target: str, validate_digest: bool) -> Response:
     rid = f"r{now_ms()}-{id(request) % 100000:05d}"
     started = now_ms()
     rec: dict = {
@@ -259,18 +427,18 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         rec["primary"] = f"connection error: {type(exc).__name__}"
         rec["result"] = "primary_error"
-        if ctx.shadow_task is not None:
-            # 主端连接失败: 终止已发起的影子; 名额由任务自身在退出时归还
-            ctx.shadow_task.cancel()
-            try:
-                await ctx.shadow_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        # 主端连接失败: 终止已发起的影子; 名额由任务自身在退出时归还
+        await terminate_shadow(ctx)
         await save_record(ctx)
         return JSONResponse(
             status_code=502,
             content={"detail": "primary quote service unavailable"},
         )
+
+    # GET /quote 的 200 响应: 收齐正文并校验 X-Quote-SHA256 后才交付;
+    # 其他状态码及 /quote-big 仍走逐块透传的原规则
+    if validate_digest and primary_resp.status == 200:
+        return await validated_proxy(request, ctx, target, primary_resp)
 
     async def body_iter():
         primary_hash = hashlib.sha256()
@@ -285,14 +453,7 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
             rec["primary"] = "aborted before completion"
             rec["result"] = "client_disconnected"
             primary_resp.release()
-            if ctx.shadow_task is not None and not ctx.shadow_task.done():
-                ctx.shadow_task.cancel()
-            if ctx.shadow_task is not None:
-                # 等待影子通信实际退出(名额随之归还), 但此路径下客户端已离开
-                try:
-                    await asyncio.shield(ctx.shadow_task)
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await terminate_shadow(ctx)  # 等影子通信实际退出(名额随之归还)
             await save_record(ctx)
             return
         except aiohttp.ClientError as exc:
@@ -300,13 +461,7 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
             rec["primary"] = f"stream error: {type(exc).__name__}"
             rec["result"] = "primary_incomplete"
             primary_resp.release()
-            if ctx.shadow_task is not None and not ctx.shadow_task.done():
-                ctx.shadow_task.cancel()
-            if ctx.shadow_task is not None:
-                try:
-                    await asyncio.shield(ctx.shadow_task)
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await terminate_shadow(ctx)
             await save_record(ctx)
             return
 
@@ -368,12 +523,21 @@ async def get_state():
 
 # 报价相关 GET 请求走代理; 网页与管理 API 不拦截
 @app.get("/quote")
-@app.get("/quote-big")
 async def quote_proxy(request: Request):
     target = request.url.path
     if request.url.query:
         target += "?" + request.url.query
-    return await proxy(request, target)
+    # /quote 的 200 响应需要 X-Quote-SHA256 正文校验
+    return await proxy(request, target, validate_digest=True)
+
+
+@app.get("/quote-big")
+async def quote_big_proxy(request: Request):
+    target = request.url.path
+    if request.url.query:
+        target += "?" + request.url.query
+    # 大响应不缓存, 仍按原规则逐块透传与摘要比对
+    return await proxy(request, target, validate_digest=False)
 
 
 app.mount("/", StaticFiles(

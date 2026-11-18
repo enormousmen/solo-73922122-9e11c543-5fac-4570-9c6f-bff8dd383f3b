@@ -20,15 +20,18 @@ PENDING_RESULTS = {"shadow_pending", "shadow_completed_primary_incomplete", "pen
 
 
 async def wait_record(s, gw, marker, timeout_s=5.0):
-    """按 marker 轮询等待对应比对记录到达终态后返回。"""
+    """按 marker 轮询等待本次运行的对应记录到达终态后返回。"""
+    full_marker = f"marker={marker}" if not marker.startswith("marker=") else marker
     deadline = asyncio.get_event_loop().time() + timeout_s
     while asyncio.get_event_loop().time() < deadline:
         recs = await (await s.get(f"{gw}/api/records")).json()
-        hit = [x for x in recs if marker in x["target"]]
+        # 精确匹配完整 marker, 避免命中历史运行遗留的同前缀记录
+        hit = [x for x in recs if full_marker in x["target"].split("&")
+               or x["target"].endswith(full_marker)]
         if hit and hit[0]["result"] not in PENDING_RESULTS:
             return hit[0]
         await asyncio.sleep(0.15)
-    raise AssertionError(f"terminal record with {marker} not found")
+    raise AssertionError(f"terminal record with {full_marker} not found")
 
 
 async def main():
@@ -134,6 +137,96 @@ async def main():
               disc[0]["result"] if disc else "")
         check("7 断连后影子名额归零", state["shadow_in_flight"] == 0,
               str(state["shadow_in_flight"]))
+
+        # 8. 正常 /quote 200 随附 X-Quote-SHA256, 且摘要覆盖交付字节
+        async with s.get(f"{GW}/quote?marker={run_id}-t8") as r:
+            hdr = r.headers.get("X-Quote-SHA256")
+            body = await r.read()
+            st8 = r.status
+        check("8 200 随附 X-Quote-SHA256", bool(hdr))
+        check("8 摘要=交付字节 SHA-256",
+              hdr == hashlib.sha256(body).hexdigest())
+        check("8 正常报价仍为 200 且交付原文", st8 == 200 and b"128.50" in body)
+
+        # 9. 坏摘要: 502 拦截, 不泄漏任何报价字节, 拒绝为终态且影子被终止
+        async with s.get(f"{GW}/quote?bad_digest=1&marker={run_id}-t9") as r:
+            bad = await r.read()
+            st9 = r.status
+        check("9 坏摘要返回 502", st9 == 502, str(st9))
+        check("9 拒绝正文不含报价", b"128.50" not in bad and b"ACME" not in bad,
+              bad[:60].decode(errors="replace"))
+        rec = await wait_record(s, GW, f"marker={run_id}-t9")
+        check("9 记录 primary_rejected", rec["result"] == "primary_rejected",
+              rec["result"])
+        check("9 记录拒绝原因", rec.get("reject_reason") == "digest mismatch",
+              rec.get("reject_reason", ""))
+        check("9 影子随拒绝终止", rec["shadow"] == "cancelled with primary",
+              rec["shadow"])
+
+        # 10. 正文超 64KiB: 502 拦截 (pad 后总字节 = 64KiB+1)
+        async with s.get(f"{GW}/quote?pad=65422&marker={run_id}-t10") as r:
+            over = await r.read()
+            st10 = r.status
+        check("10 超 64KiB 返回 502", st10 == 502 and b"128.50" not in over, str(st10))
+        rec = await wait_record(s, GW, f"marker={run_id}-t10")
+        check("10 拒绝原因为超限", rec["result"] == "primary_rejected"
+              and rec.get("reject_reason") == "quote body too large",
+              rec.get("reject_reason", ""))
+
+        # 11. 恰好 64KiB 边界: 正常交付 (基础正文 115B + pad 65421)
+        async with s.get(f"{GW}/quote?pad=65421&marker={run_id}-t11") as r:
+            edge = await r.read()
+            st11 = r.status
+        check("11 恰好64KiB放行", st11 == 200 and len(edge) == 65536,
+              f"{st11}/{len(edge)}")
+
+        # 12. 正文未收完整 (cut): 502 拦截
+        async with s.get(f"{GW}/quote?cut=1&marker={run_id}-t12") as r:
+            cut = await r.read()
+            st12 = r.status
+        check("12 未收完整返回 502", st12 == 502 and b"128.50" not in cut, str(st12))
+        rec = await wait_record(s, GW, f"marker={run_id}-t12")
+        check("12 拒绝原因为不完整", rec["result"] == "primary_rejected"
+              and rec.get("reject_reason") == "quote body incomplete",
+              rec.get("reject_reason", ""))
+
+        # 13. 非 200 状态码不做摘要校验, 原样透传 (404 无摘要头也放行)
+        async with s.get(f"{GW}/quote?status=404&marker={run_id}-t13") as r:
+            n200 = await r.read()
+            st13 = r.status
+            hdr13 = r.headers.get("X-Quote-SHA256")
+        check("13 非200原样透传", st13 == 404 and b"128.50" in n200 and not hdr13,
+              f"{st13}/hdr={hdr13}")
+
+        # 14. 迟到的影子结果不得改写拒绝结论 (主端坏摘要快速拒绝, 影子延迟晚结束)
+        async with s.get(
+                f"{GW}/quote?bad_digest=1&s_delay=1.5&marker={run_id}-t14") as r:
+            await r.read()
+        rec = await wait_record(s, GW, f"marker={run_id}-t14")
+        check("14 迟到影子不改写拒绝", rec["result"] == "primary_rejected",
+              rec["result"])
+        for _ in range(25):
+            st = await (await s.get(f"{GW}/api/state")).json()
+            if st["shadow_in_flight"] == 0:
+                break
+            await asyncio.sleep(0.2)
+        # 再拉一次确认影子退出后结论仍未被覆盖
+        recs = await (await s.get(f"{GW}/api/records")).json()
+        rec = [x for x in recs if f"marker={run_id}-t14" in x["target"]][0]
+        check("14 影子退出后结论仍为拒绝", rec["result"] == "primary_rejected",
+              rec["result"])
+        state = await (await s.get(f"{GW}/api/state")).json()
+        check("14 名额最终归还", state["shadow_in_flight"] == 0,
+              str(state["shadow_in_flight"]))
+
+        # 15. 拒绝之后后续正常报价立即恢复 200 交付
+        async with s.get(f"{GW}/quote?marker={run_id}-t15") as r:
+            after = await r.read()
+            st15 = r.status
+            hdr15 = r.headers.get("X-Quote-SHA256")
+        check("15 拒绝后正常报价恢复", st15 == 200
+              and hdr15 == hashlib.sha256(after).hexdigest(),
+              str(st15))
 
     print(f"\n汇总: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

@@ -2,7 +2,8 @@
 本地 GET 报价服务, 主端与影子端共用同一镜像, 用 SERVICE_ROLE 区分。
 
 能力:
-- GET /quote            普通 JSON 报价 (两端默认字节完全一致)
+- GET /quote            普通 JSON 报价 (两端默认字节完全一致), 200 响应随附
+                         X-Quote-SHA256 (对实际交付字节的 SHA-256 摘要)
 - GET /quote-big        流式大响应 (默认 32 MiB, 确定性字节, 两端一致)
 - GET /healthz          健康检查
 
@@ -12,6 +13,9 @@
 - status=<码>           自定义 HTTP 状态码
 - fail=1                立即返回 500
 - diff=1                影子端制造可比对的差异 (主端忽略)
+- bad_digest=1          X-Quote-SHA256 故意给错 (两端各自生效, 用于网关拦截演示)
+- pad=<字节>            在 /quote 正文末尾填充指定字节的 'A' (用于制造超过 64KiB 的正文)
+- cut=1                 只发送一半正文却声明完整 Content-Length (模拟未收完整)
 - size=<字节>           /quote-big 的响应大小 (默认 33554432 = 32MiB)
 - chunk_ms=<毫秒>       /quote-big 每块之间的延迟, 便于观察流式行为
 """
@@ -23,7 +27,7 @@ import json
 import os
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 ROLE = os.environ.get("SERVICE_ROLE", "primary")
 PORT = int(os.environ.get("SERVICE_PORT", "8000"))
@@ -83,8 +87,36 @@ async def quote(request: Request):
         status = int(q.get("s_status", str(status)))
 
     payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
-    # 两端响应头保持一致, 差异只体现在 body 上, 避免干扰字节级比对
-    return JSONResponse(status_code=status, content=json.loads(payload))
+
+    # pad: 填充正文以便制造超过网关 64KiB 校验上限的响应 (上限 1MiB 防止误打服务)
+    pad = max(0, min(int(q.get("pad", "0")), 1024 * 1024))
+    if pad:
+        payload += b"A" * pad
+
+    if q.get("cut") == "1":
+        # 只发一半字节却保留完整 Content-Length: 对端读取中途连接不完整
+        half = payload[: len(payload) // 2]
+        return Response(
+            content=half,
+            status_code=status,
+            media_type="application/json",
+            headers={"Content-Length": str(len(payload))},
+        )
+
+    # 网关只对 200 做摘要校验: 仅 200 随附 X-Quote-SHA256, 且摘要覆盖实际交付字节
+    headers = {}
+    if status == 200:
+        digest = hashlib.sha256(payload).hexdigest()
+        if q.get("bad_digest") == "1":
+            # 故意给错的摘要: 网关必须在交付前拦截
+            digest = "0" * 64
+        headers["X-Quote-SHA256"] = digest
+    return Response(
+        content=payload,
+        status_code=status,
+        media_type="application/json",
+        headers=headers,
+    )
 
 
 def _deterministic_block(index: int, size: int) -> bytes:
